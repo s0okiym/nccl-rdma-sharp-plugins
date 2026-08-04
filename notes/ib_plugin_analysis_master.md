@@ -814,3 +814,176 @@ tag=11 大小 10000，tag=22 大小 300；设 fifoHead=5（slot=5）。
 - **`pHandle` 参数**：v11 给 profiler 的 proxy handle，IB 后端透传未用。
 - **`slots[0]` 的 memset 只清一个 elem**：就绪判断只看 `slots[0].idx`，该 slot
   下次复用时对端会整组重写；清零只为防旧值误判与调试。
+
+## 15. 附 D：tag 的含义、产生与匹配机制
+
+### 15.1 tag 匹配指的是什么
+
+插件内部两处配合（`src/ib_plugin.c`）：
+
+- 接收端 post credit 时把 NCCL 给的 tag 写进每个 elem：
+  `localElem[i].tag = tags[i]`（`ib_plugin.c:1833`）；
+- 发送端 isend 在当前 fifo 组内找"**未被认领且 tag 相等**"的 elem：
+  `if (reqs[r] != NULL || slots[r].tag != tag) continue;`（`ib_plugin.c:1746`）。
+
+找不到匹配就返回 `*request = NULL`，NCCL 稍后重试。匹配的作用是去复用
+（demux）：**一条 IB 连接上混跑多条逻辑数据流时，tag 决定这条消息该落进哪个
+buffer**。插件从头到尾不理解 tag 的语义，只做相等比较。
+
+### 15.2 tag 的含义：发送方 rank
+
+tag 的语义是"**消息的发送者是谁**"，具体值是发送 rank 的 `topParentRank`
+（无 PXN 时即为 communicator 内的 rank 号）：
+
+- 发送方给每条消息盖章"我是谁"：`isend(..., resources->tpRank, ...)`
+  （NCCL `src/transport/net.cc:1414`）；
+- 接收方给每个 buffer 盖章"我等谁"：`tags[subCount] = resources->tpRemoteRank`
+  （net.cc:1575）。
+
+两端一致，故能匹配。
+
+### 15.3 tag 是怎么产生的
+
+tag 不是插件产生的，而是 NCCL 核心在三个环节生成传递（以下行号取自 NCCL
+master 的 `src/transport/net.cc`）：
+
+1. **建连时**（`sendSetup`/`recvSetup`，net.cc:318/371）：
+   `req.tpRank = comm->topParentRanks[myInfo->rank]`（本端 rank）、
+   `req.tpRemoteRank = comm->topParentRanks[peerInfo->rank]`（对端 rank），
+   存入该连接的 proxy resources。
+2. **发送推进时**（`sendProxyProgress`，net.cc:1414）：每次 isend 用本连接的
+   `resources->tpRank` 作 tag。
+3. **接收推进时**（`recvProxyProgress`，net.cc:1525-1590）：grouped irecv 组装
+   一组 sub 请求，**每个 sub 用它自己连接的 `tpRemoteRank`** 填
+   `tags[subCount]`，整组一并传给插件。
+
+### 15.4 为什么需要 tag
+
+插件向 NCCL 上报 `maxRecvs=8`，且 NCCL 默认 `NCCL_NET_SHARED_COMMS=1`——同一
+节点上多个本地 rank 的逻辑流**共享同一条 sendComm/recvComm 物理连接**（每对
+netDev×remoteRank 只建一条）。于是 grouped irecv 的一组 elem 里可能混着"等
+rank A 数据的 buffer"和"等 rank B 数据的 buffer"，而共享连接那头发送的消息也
+来自不同 rank。若没有 tag，只能按位置顺序匹配，而两端各自的分组顺序相互独立，
+必然错配——rank A 的数据可能落进等 rank B 的 buffer。有了 tag（=发送方 rank），
+每条消息对号入座。
+
+历史对照：**v3 API 的 isend/irecv 没有 tag 参数**——那时一条连接只承载一条流，
+严格 FIFO 对齐即可，插件仅用 `seq != fifoHead` 校验顺序错配（见
+`notes/ib_plugin_analysis_hpcx-v2.7.0.md` §5）。tag 是 v8 引入
+grouped/multi-recv 与 shared comms 之后的配套机制。
+
+## 16. 附 E：grouped irecv 全链路解析
+
+### 16.1 形态
+
+v8+ 的 irecv 一次 post **n 个**（buffer, size, tag, mhandle），n ≤ `maxRecvs`
+（IB 插件上报 `NCCL_NET_IB_MAX_RECVS=8`），产出**一个** request（v3 一次只 post
+一个 buffer）。这一组 buffer 在插件里对应 fifo 的一行
+`fifo[slot][0..n-1]`——**"组"是调度、发射、完成的基本单位**。
+
+### 16.2 动机
+
+- **shared comms 的去复用**：一个 recvComm 同时承载多条流的接收，需一次挂出
+  分属不同流的多个 buffer（配 tag 区分，见附 D）；
+- **省 credit 开销**：一组 n 个接收只用**一条 RDMA_WRITE** 把 n 个 credit elem
+  推给发送端，而非 n 条——credit 是每步流水线都要发的控制流量，聚合成 1/8 后
+  显著降低 QP 压力与延迟；
+- **匹配 NCCL 的 group 语义**：`ncclGroup` 中多个 send/recv 在 proxy 层天然成批
+  提交，分组接收一次消化。
+
+### 16.3 NCCL 侧：组的形成与下发
+
+（行号取自 NCCL master `src/transport/net.cc` 的 `recvProxyProgress`）
+
+1. **分组形成**（net.cc:1500-1510 附近）：proxy op 被 append 时，同批 subs 打上
+   相同 `groupSize`；主循环按组步进
+   `for (s = 0; s < args->nsubs; s += args->subs[s].groupSize)`。
+2. **组装数组**（net.cc:1519-1583）：遍历组内 subs，只要该 sub 还有 step 未
+   post（`posted < nsteps`）且未超流水线深度
+   （`posted < done + maxDepth`，`maxDepth = min(NCCL_STEPS,
+   NCCL_SHARED_STEPS/nsubs)`），就把当前 step 填入并行数组
+   `ptrs/sizes/tags/mhandles/phandles[subCount]`；其中
+   `tags[subCount] = resources->tpRemoteRank`（该 sub 所属流的对端 rank）。
+3. **一次下发**（net.cc:1590）：`ncclNet->irecv(recvComm, subCount, ptrs, sizes,
+   tags, mhandles, phandles, requestPtr)`；`recvComm` 取自组内第一个 sub 的连接
+   ——shared comms 保证同组共享同一 recvComm。LL/LL128 且 `subCount==1` 时置
+   `NCCL_NET_OPTIONAL_RECV_COMPLETION`，NCCL 可不等完成回执（net.cc:1585-1588）。
+
+### 16.4 插件侧：ncclIbIrecv + ncclIbPostFifo
+
+`ncclIbIrecv`（`ib_plugin.c:1889`）收下一个组后做三件事：
+
+1. **建一个组级请求**：`req->type = RECV, req->nreqs = n`，per-dev `devBases`
+   预填。整组共享这一个 request——NCCL test 一次，拿回全部 n 个 size。
+2. **挂空 recv WR**（:1916-1925）：在 `nDataQps` 个 QP 上各挂一个
+   `num_sge=0` 的 recv WR（轮转 `qpIndex`），每个 QP 给对应 dev 计一个 event。
+   这些 WR 不接收数据（数据由发送端 RDMA 直接写入用户 buffer），只承接每个
+   数据 QP 收尾那条 `RDMA_WRITE_WITH_IMM` 产生的 CQE。
+3. **发整组 credit**（`ncclIbPostFifo`，:1809）：
+
+```c
+slot = comm->remFifo.fifoTail % MAX_REQUESTS;  // 组序号取模
+req->recv.sizes = comm->sizesFifo[slot];        // sizes 回传指针绑定本组槽位
+for (i=0; i<n; i++) req->recv.sizes[i] = 0;
+for (i=0; i<n; i++)
+  localElem[i] = { addr=data[i], size=sizes[i], tag=tags[i],
+                   rkeys[j]=每个本地 dev 的 MR rkey, nreqs=n, idx=fifoTail+1 };
+wr = RDMA_WRITE(对端 fifo + slot*8*sizeof(elem), 负载 = n 个 elem 一次写完);
+```
+
+- `idx = fifoTail+1`：全组 elem 同一序号，发送端据此判断"这组 credit 有效"
+  （`slots[0].idx == fifoHead+1`）；
+- 一条 RDMA_WRITE 推 n 个 elem——"省 credit"的落点；
+- CTS QP 按 `base.devIndex` 轮转；默认 unsignaled，仅当
+  `slot == ctsQp->devIndex` 时升级 signaled 并计入 event——周期性排水，防止
+  SQ 被 unsignaled WR 塞满（:1852-1874 的注释）；
+- `fifoTail++` 推进到下一组。
+
+**`req->recv.sizes` 的绑定**是关键：接收端无法直接得知每条流实际收到多少字节
+（发送端可能截断），发送端会把真实 sizes 数组 RDMA 到接收端 `sizesFifo[slot]`
+（n>1 时），req 只是提前把指针指过去；n==1 时 size 走 imm_data，不用它。
+
+### 16.5 发送侧配合（衔接附 C）
+
+组 credit 到达后，发送端逐条 isend 按 tag 认领 elem；**全组 n 个 elem 都被认领
+后**才调 MultiSend：每个请求一个数据 `RDMA_WRITE` 串成 WR 链，末尾追加
+`RDMA_WRITE_WITH_IMM`（imm=0），其负载是各请求真实 size 数组，写入接收端
+`sizesFifo[slot]`；整链在 nDataQps 个 QP 上各发一份（128B 对齐切条），每个 QP
+产出一条发送端 signaled CQE 与一条接收端 imm CQE。接收端一个组的总账：
+`nDataQps` 条 imm CQE + 可能的 1 条 credit signaled CQE，全部计入
+`req->events[]`，归零即完成。
+
+### 16.6 完整时序（n=3，单 QP 简化）
+
+```
+接收端                                     发送端
+──────                                     ──────
+NCCL: 3 个 sub 组一组
+irecv(n=3, ptrs, sizes, tags):
+  req{nreqs=3, recv.sizes=&sizesFifo[5]}
+  post_recv(空WR) × nDataQps
+  postFifo: RDMA_WRITE ── elem[0..2]{addr,size,tag,idx=6} ──► fifo[5]
+                                       isend(msgB, tag=22): 命中 elem1 → 认领
+                                       isend(msgA, tag=11): 命中 elem0 → 认领
+                                       isend(msgC, tag=33): 命中 elem2 → 组齐!
+                                       MultiSend: WR链[WrA, WrB, WrC,
+                                         WrImm(负载sizes{...}→sizesFifo[5],
+                                               imm=0, SIGNALED)]
+                                         post 到每个数据 QP
+数据 RDMA 直接落入 ptrs[0..2] ◄──────────
+test: imm CQE × nDataQps (+credit WC)
+      → events 归零 → done
+      sizes[] = sizesFifo[5] = {实际3个size}
+NCCL: 一个 request 完成 → 3 个 sub 的 received 推进
+```
+
+### 16.7 边界点
+
+- **n=1 退化**：size 走 imm_data，不用 sizesFifo；末尾 WR 不追加（自身升级为
+  WRITE_WITH_IMM）；
+- **容量账**：64 个 slot = 最多 64 组在途；每组 ≤8 个接收；请求池 64（recv 每
+  组 1 个、send 每元素 1 个）——NCCL 侧 `maxDepth` 保证不超发；
+- **组间保序、组内乱序**：发送端严格按 `fifoHead` 顺序消费组，组内按 tag 乱序
+  认领——这是 grouped 模型与 tag 匹配的分工；
+- **一个 request 代表一整组**：NCCL 不能"部分完成"某个 sub——组内所有流的这步
+  step 同生共死，这也是 NCCL 只把"同批 append、共享连接"的 subs 放一组的原因。
