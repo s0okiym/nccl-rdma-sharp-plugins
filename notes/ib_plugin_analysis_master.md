@@ -987,3 +987,138 @@ NCCL: 一个 request 完成 → 3 个 sub 的 received 推进
   认领——这是 grouped 模型与 tag 匹配的分工；
 - **一个 request 代表一整组**：NCCL 不能"部分完成"某个 sub——组内所有流的这步
   step 同生共死，这也是 NCCL 只把"同批 append、共享连接"的 subs 放一组的原因。
+
+## 17. 附 F：容量辨析——"每组 8 个"与单机多 GPU 的关系
+
+疑问：grouped irecv 每组最多 `NCCL_NET_IB_MAX_RECVS=8` 个 buffer，单机 16（或更多）
+块 GPU 时是否不够用？答案是否定的——**8 是"单批"上限，不是"总量"上限**。
+
+### 17.1 NCCL 侧自动拆批
+
+`recvProxyProgress` 的分组逻辑（NCCL `src/transport/net.cc:1475-1500`）：
+
+```c
+// Initialize subs and group them by same recvComm.
+for (int s = 0; s < args->nsubs; s++) {
+  if (groupSize == maxRecvs) {
+    groupSize = 0;              // 满 8 个就开新组
+  } else if (s > 0) {
+    // 把后面相同 recvComm 的 sub 交换过来聚拢
+    ...
+  }
+  groupSize++;
+  ...
+}
+```
+
+- 组按 **recvComm 聚类**：不同连接的 sub 不会混进一组；
+- 组大小硬上限 = 插件上报的 `maxRecvs`（IB=8）：16 条流共享一条连接时拆成
+  8+8 两组、发两个 irecv。插件永远收不到 n>8 的调用（`ib_plugin.c:1895` 的
+  报错只是防御）；主循环 `for (s = 0; s < args->nsubs; s += groupSize)` 逐组处理。
+
+### 17.2 插件侧：组是循环复用的流水线槽位
+
+一条连接的真实容量是 **64 组在途**（`MAX_REQUESTS=64` 个 fifo slot + 64 个请求
+池槽位），每组最多 8 个 buffer——理论最多 512 个已公告接收、64 组流水。16 卡
+共享一条连接只占 2 个 slot。组完成后 slot 与请求立即回收复用，NCCL 侧用
+`maxDepth = min(NCCL_STEPS, NCCL_SHARED_STEPS/nsubs)` 控制超前深度。正如 TCP
+窗口大小不限制文件总大小，8 只决定"每批多大"，不决定"能承载多少流"。
+
+### 17.3 真实场景中一条连接的流数
+
+- **集合通信（ring/tree）**：每个 rank 只有 1~3 个对端，每条连接一条流，组大小
+  为 1，8 根本用不满；
+- **p2p 批量（all-to-all、`ncclGroup` 多对端）**：multi-recv 的用武之地。shared
+  comms 按 `(netDev, 对端 proxy rank, channelId)` 合并——落到某一条连接上的是
+  "本节点若干 rank ↔ 同一对端"的流，受 `p2pnChannels` 限制，通常几条到十几条；
+  超 8 条即按 §17.1 拆成多组。
+
+### 17.4 "8" 不构成瓶颈的边界
+
+- 每 vDev 最多融合 4 张物理卡（`NCCL_IB_MAX_DEVS_PER_NIC=4`），16 卡节点是 16
+  个独立 vDev 各用各的连接，与 8 无关；
+- 物理设备上限 `MAX_IB_DEVS=32`、vDev 上限 `MAX_IB_VDEVS=256`、每连接 QP 上限
+  `NCCL_IB_MAX_QPS=128`，均与 8 无关。
+
+8 只是 NCCL 与插件约定的甜点批大小：批越大 credit 聚合越省（一条 RDMA_WRITE
+推 8 个），但"组齐才发"的耦合同步也越强。单机 16/32 卡只是让每条连接多拆几组，
+功能与性能路径完全一致。
+
+## 18. 附 G：NCCL proxy 的 args/subs 模型
+
+理解 grouped irecv 的上游：插件看到的"组"来自 NCCL proxy 的 `ncclProxyArgs`。
+一句话模型：**args 是提交给 proxy 线程的一个"工作包"，sub 是包里的一条流**。
+一次 GPU kernel 启动对应的网络工作通常不止一条流，故一个 args 挂多个 sub。
+
+（本节行号取自 NCCL master 的 `src/include/proxy.h`、`src/proxy.cc`。）
+
+### 18.1 数据结构的分工（proxy.h:140-215）
+
+- **args 持有"全组一致"的字段**：`protocol`、`algorithm`、`coll`、`dtype`、
+  `redOp`、`sliceSteps/chunkSteps/chunkSize`（流水线切分参数）、`pattern`
+  （Send/Recv/Coll）、`nChannels/nPeers`、`progress`（传输层 progress 函数）；
+- **每个 sub 持有"一条流各自"的字段**：`connection`（属于哪条 proxy 连接）、
+  `peer`、`channelId`、`sendbuff/recvbuff`、`nbytes`、`nsteps`，独立的进度计数器
+  `posted/received/transmitted/flushed/done`、`requests[NCCL_STEPS]`（每步的
+  net request），以及附 E 中的 `groupSize`。
+
+即：args 决定"这批流按什么协议、什么步调走"，sub 记录"我这条流走到哪了"。
+
+### 18.2 sub 如何挂进 args（proxy.cc:360-470）
+
+上层提交的工作单元是 `ncclProxyOp`（一条连接上的一段工作）。`ProxyAppend`
+决定合并还是新起 args：
+
+```c
+if (shared && args->opCount == op->opCount) {
+  ncclProxyOpToArgs(op, args, args->nsubs);   // 同一批工作 → 追加为下一个 sub
+}
+```
+
+- `opCount` 是 communicator 内单调递增的启动计数——**同一 opCount = 同一次
+  kernel 启动/同一批 group 工作**，满足条件即挂入现有 args 的 `subs[nsubs++]`；
+- `ncclProxyOpToArgs` 校验同组 ops 的 `sliceSteps/chunkSteps/protocol/dtype/
+  redOp/coll` 必须一致，否则报 `"Proxy append mismatch"`——步调完全相同的流
+  才允许同包；
+- 上限 `NCCL_PROXY_MAX_SUBS = MAXCHANNELS`（通常 32）。
+
+两条典型来源：
+
+1. **集合通信**：一个 coll 操作按 channel 并行拆分，每个 channel 对其 peer 有
+   一条收/发流 → 同一 opCount 的多个 op 合并，nsubs ≈ 该操作用的 channel 数
+   （ring：每 channel 1 个 peer；tree：最多 3 个）；
+2. **p2p group（`ncclGroup` 批量 send/recv）**：一批提交多个对端的收发 → 同一
+   opCount，每个 sub 是一个 (peer, channel, 方向) 流；all-to-all 时一个 args
+   可挂很多 sub。
+
+### 18.3 设计意图
+
+- **同生共死**：一个 kernel 的所有 channel/流必须协同推进（kernel 等待全部
+  完成），包成一个 args 统一调度、统一回收；
+- **批处理效率**：proxy 线程每轮 progress 处理一个 args 的所有 subs，一次唤醒
+  推进多条流；
+- **为 grouped net 操作供料**：正因一个 args 天然聚了一束流，
+  `recvProxyProgress` 才能按 recvComm 聚类、拆出 ≤maxRecvs 的组，调一次
+  grouped irecv（附 E 入口 `for (s = 0; s < args->nsubs; s += groupSize)`）。
+  **sub 是 NCCL 的调度单位，"组"是插件的发射单位**，这层映射靠 subs 数组完成；
+- **进度独立**：每个 sub 五套计数器各记各的，args 级循环"给所有 sub 各推进
+  一步"，快流慢流互不阻塞。
+
+### 18.4 直观示例
+
+NCCL 自带的 `printProxyOp`（proxy.cc:266）即按此模型打印：
+
+```
+[0-3|12345|Coll 7R/2 5D/2 9G/3]   ← 一个 Coll args，3 个 sub：
+                                    对端7 channel2 接收中、对端5 channel2 完成、对端9 channel3 等GPU
+[0-4|12346|Recv 12I/0 12I/1]      ← p2p 接收 args：对端12 的 channel0/1 两条流
+```
+
+`peer状态/channel` 每段一个 sub。`NCCL_DEBUG=PROXY` 下可见真实 args 调度序列，
+与插件侧 `NET/IB` 日志中的 grouped irecv 一一对应。
+
+### 18.5 完整链条
+
+用户 API（coll / p2p group）→ 每 channel/对端一个 proxy op → 同 opCount 合并
+为一个 args（多 subs）→ proxy 按 recvComm 把 subs 聚成 ≤8 的组 → 插件
+grouped irecv 一次 post 一组 → 一个 request 完成整组。
