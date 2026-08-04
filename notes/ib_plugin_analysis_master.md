@@ -627,3 +627,190 @@ WR 链一次发出，sizes 数组经 sizesFifo 送达；多 QP 时每 QP 一份 
 | flush | 同步忙等 | 异步 iflush 请求 |
 | 错误 | WARN + ncclSystemError | fatal 统计传播、ncclRemoteError、GID 日志 |
 | AR/ECE/data-direct | 无 | 有 |
+
+## 14. 附 C：`ncclIbIsend` / `ncclIbMultiSend` 逐段精讲
+
+§7 给出了数据路径的整体模型，本附录对发送侧这两个函数做逐行级拆解
+（`ib_plugin.c:1620-1807`）。
+
+### 14.1 分工与三个游标
+
+- `ncclIbIsend`：**匹配阶段**——等接收端 credit、按 tag 认领槽位、建请求；
+  一组请求全部认领完才调 `ncclIbMultiSend`。
+- `ncclIbMultiSend`：**发射阶段**——把整组请求组装成 WR 链，按多 QP 切条 post。
+
+贯穿始终的三个游标：
+
+- `fifoHead`：单调递增的**组序号**，第 G 组消息用 `slot = G % 64` 这一行 fifo；
+- `qpIndex`：本条消息从哪个 QP 开始切条，每条消息发完轮转 +1（跨消息负载均衡）；
+- `fifoReqs[slot]`：这一行 8 个位置存放"已认领的发送请求"指针，初始全 NULL。
+
+fifo 是二维的 `fifo[64][8]`：64 个 slot（组）× 每组最多 8 个 elem（一次 grouped
+irecv 的 n 个 buffer）。接收端 `postFifo` 把一组 elem 一次 RDMA 写到 `fifo[slot]`，
+所有 elem 的 `idx` 都写成 `fifoTail+1`。
+
+### 14.2 `ncclIbIsend` 逐段
+
+**(1) 等 credit**（`ib_plugin.c:1736-1740`）：
+
+```c
+int slot = comm->fifoHead % MAX_REQUESTS;
+uint64_t idx = comm->fifoHead + 1;
+if (slots[0].idx != idx) { *request = NULL; return ncclSuccess; }
+```
+
+`idx` 是"第 fifoHead 组应有的序号"。对端还没 post 对应 irecv 时 `slots[0].idx`
+是旧值，返回 NULL 让 NCCL 重试——流控只是读本地内存（credit 由对端网卡 DMA
+进来），零系统调用。
+
+**(2) 自旋等全组到齐**（`ib_plugin.c:1741-1744`）：
+
+```c
+nreqs = slots[0].nreqs;
+for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
+__sync_synchronize();
+```
+
+对端用一条 RDMA_WRITE 写 n 个 elem，但字节陆续落盘，`slots[0]` 到了不代表
+`slots[n-1]` 到了。两个设计细节：
+
+- `idx` 是 elem 结构体的**最后一个字段**（offset 40；elem 共 64 字节、32B 对齐，
+  即 init 中那组静态断言的目的）。写按序落盘，看到 `idx` 就位即表示前面的
+  addr/size/rkeys/tag 已就位；`__sync_synchronize()` 补上 CPU 侧内存序。
+- 对 `slots[0]` 是"返回 NULL 重试"，对 1..n-1 却是**死等**：`nreqs` 本身存在
+  `slots[0]` 里，`slots[0].idx` 正确后才知道要再等几个；对端 credit 已发出，
+  剩余字节马上就到，自旋有界。
+
+**(3) tag 匹配**（`ib_plugin.c:1745-1746`）：
+
+```c
+for (int r=0; r<nreqs; r++) {
+  if (reqs[r] != NULL || slots[r].tag != tag) continue;
+```
+
+grouped recv 一次 post n 个 (buffer, tag)，发送端逐条 isend，两边顺序可以不同。
+每次在组内找"未被认领（`reqs[r]==NULL`）且 tag 相等"的 elem；找不到返回 NULL
+重试。认领后 `size = min(size, slots[r].size)`（截断语义，§7.3）。
+
+**(4) events 预排**（`ib_plugin.c:1767-1780`，最易混的一段）：
+
+```c
+int nEvents = nDataQps;              // 本条消息将经过几个 QP
+int qpIndex = comm->base.qpIndex;    // 局部副本！
+while (nEvents > 0) {
+  ncclIbQp* qp = comm->base.qps + qpIndex;
+  ncclIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base); // events[dev]++
+  nEvents--;
+  qpIndex = (qpIndex+1) % comm->base.nqps;   // 不动 comm->base.qpIndex
+}
+```
+
+send 请求的完成条件是"每个承担数据的 QP 都回报一个 signaled CQE"。这里**预先
+走一遍** MultiSend 将要使用的 QP 序列并计数。注释明确：此时不能推进
+`comm->base.qpIndex`，因为 MultiSend 还要从同一起点走一遍——两处必须严格一致，
+否则 events 计在 dev A、CQE 却落在 dev B 的 CQ 上，请求永远无法完成。
+（events 按 dev 而非按 QP 计，是因为 CQ 是 per-dev 的；同一 dev 上两个 QP 时
+`events[dev]` 自然计 2。）
+
+**(5) 组齐才发**（`ib_plugin.c:1787-1801`）：
+
+```c
+*request = reqs[r] = req;
+for (int r=0; r<nreqs; r++) if (reqs[r] == NULL) return ncclSuccess;
+```
+
+把请求挂进 `fifoReqs[slot][r]` 后检查组内有无空位：有就直接返回。注意此时
+`*request` 已交给 NCCL，但**网线上一个包都没发**——该请求将由"填补最后一个
+空位的那次 isend"触发的 MultiSend 一并发出、一并完成。因此 test() 一个早已
+返回的请求长时间不完成是正常现象。
+
+组齐后：调 MultiSend → `memset(slots[0])` 清首个 elem（复位 nreqs/idx 防旧值
+误判，就绪判断只看 `slots[0].idx`）→ 清 `fifoReqs[slot]` → `fifoHead++`。
+
+### 14.3 `ncclIbMultiSend` 逐段
+
+**(1) 组 WR 链 + wr_id 打包**（`ib_plugin.c:1626-1639`）：每个请求一个
+`IBV_WR_RDMA_WRITE`（数据），`next` 串链；`wr_id` 把组内各请求在请求池中的
+**下标按字节打包**（第 r 字节 = 第 r 个请求下标）。完成时 test() 一条 CQE 即可
+解出全组请求逐个 `events[i]--`——这是请求池 ≤256 的原因。
+
+**(2) size 的两种回传**（`ib_plugin.c:1643-1651`）：
+
+- `nreqs==1`：`immData = size`，随 WRITE_WITH_IMM 的 imm_data 送达，接收端
+  `sizes[0]` 直接取自 WC；
+- `nreqs>1`：imm 只有 32 位不够用。各请求 size 先写入本地 staging
+  `remSizesFifo.elems[slot]`，由追加的 WR 一并 RDMA 到**接收端 `sizesFifo[slot]`**
+  （建链时其 rkey/addr 已回传）；接收端 irecv 时已把 `req->recv.sizes` 指向
+  `sizesFifo[slot]`，DMA 落入后 test 即可读出。此时 imm=0。
+
+**(3) 末尾 WR 的三种形态**（`ib_plugin.c:1653-1671`）：
+
+- **单请求普通**：`wrs[0]` 自身升级为 WRITE_WITH_IMM（数据+imm 一条 WR），
+  signaled；
+- **多请求**：追加第 nreqs+1 个 WR，负载为 sizes 数组（写对端 sizesFifo），
+  opcode WRITE_WITH_IMM，imm=0；
+- **AR + 大消息**（> `NCCL_IB_AR_THRESHOLD`，默认 8192）：数据 WR 保持普通
+  RDMA_WRITE 且**不 signaled**，追加 0 字节 WRITE_WITH_IMM（imm=size）收尾。
+  AR 下包可走不同路径，把"完成通知"独立成小尾巴，接收端按 PSN 顺序产出 CQE
+  时数据必然已全部落盘；发送端每个 QP 也只产生一个 CQE。
+
+**(4) 多 QP 切条循环**（`ib_plugin.c:1673-1719`，核心）：
+
+```c
+for (int i = 0; i < nqps; i++) {          // 默认 nqps = nDataQps
+  ncclIbQp* qp = comm->base.qps + comm->base.qpIndex;
+  for (int r=0; r<nreqs; r++) {
+    wrs[r].wr.rdma.rkey = slots[r].rkeys[qp->remDevIdx];   // 对端那个 dev 的 rkey
+    int chunkSize = DIVUP(DIVUP(size, nqps), 128) * 128;   // 每条 128B 对齐
+    int length = MIN(size - offset, chunkSize);            // 末 QP 拿短尾巴
+    sges[r] = { addr+offset, length, lkeys[devIndex] };    // 本地这个 dev 的 lkey
+  }
+  wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr);          // 整条链挂这个 QP
+  for (r...) { offset += chunkSize; sge.addr += chunkSize; remote_addr += chunkSize; }
+  comm->base.qpIndex = (qpIndex+1) % comm->base.nqps;      // 下条消息换起始 QP
+}
+```
+
+每圈改三处后重 post 同一条链：**rkey 按 `remDevIdx` 选**（接收端把同一 buffer
+在其每张卡上各注册一遍，credit 携带全部 rkey）、**lkey 按 `devIndex` 选**（本地
+同理）、**SGE/远端地址推进一个 chunk**。128B 对齐是因为 NCCL 的 LL/LL128 协议
+按固定粒度在数据流里找 flag，条带边界不能切在 flag 中间。`length<=0` 时
+`num_sge=0` 仍 post（0 字节 WR 合法，且 nreqs==1 时它本身就是带 imm 的收尾 WR）。
+
+### 14.4 完整算例
+
+设 `nDataQps=2`（QP0 在 dev0、QP1 在 dev1），接收端 grouped irecv 两个 buffer：
+tag=11 大小 10000，tag=22 大小 300；设 fifoHead=5（slot=5）。
+
+1. 接收端 postFifo 写 `fifo[5]`：elem0={addrA, 10000, rkeys, tag=11, nreqs=2,
+   idx=6}，elem1={addrB, 300, rkeys, tag=22, nreqs=2, idx=6}。
+2. `isend(dataX, 300, tag=22)`：`slots[0].idx==6` 通过；自旋等 `elem1.idx==6`；
+   tag 命中 elem1 → 建 req_b 放入 `fifoReqs[5][1]`，events 预排（dev0+1、dev1+1）；
+   `fifoReqs[5][0]` 仍为 NULL → **返回，未发任何数据**。
+3. `isend(dataY, 12000, tag=11)`：命中 elem0，size 截断为 10000；req_a 放入
+   `fifoReqs[5][0]`；组齐 → MultiSend：
+   - wrs[0]=WRITE(dataY→addrA)，wrs[1]=WRITE(dataX→addrB)，追加 wrs[2]=
+     WRITE_WITH_IMM（负载 sizes{10000,300} → 对端 sizesFifo[5]，imm=0，
+     signaled），wr_id 两个字节分别为两请求下标；
+   - chunkSize(req_a)=DIVUP(DIVUP(10000,2),128)×128=5120；chunkSize(req_b)=
+     DIVUP(150,128)×128=256；
+   - QP0：req_a 发 [0,5120)，req_b 发 [0,256)，post 链，offset 推进 5120/256；
+   - QP1：req_a 发 MIN(10000-5120,5120)=4880 字节 [5120,10000)，req_b 发
+     MIN(300-256,256)=44 字节 [256,300)，post 链。
+4. 每 QP 仅 wrs[2] signaled → 发送端 2 条 CQE（dev0、dev1 的 CQ 各一）；test 解
+   wr_id 两个字节，req_a、req_b 的 events 各递减至全零 → 两请求均 done。
+5. 接收端收到 2 条 RECV_RDMA_WITH_IMM（imm=0），sizes 从 `sizesFifo[5]` 读出
+   {10000, 300}。
+
+### 14.5 易混点备忘
+
+- **events 预排与 MultiSend 的 QP 序列**：isend 用 `qpIndex` 局部副本预走，
+  MultiSend 从 `comm->base.qpIndex` 实走并推进——序列必须一致（§14.2 (4)）。
+- **request 早返回 ≠ 已发送**：组内最后一个空位被填补的那次 isend 才真正发射
+  全组（§14.2 (5)）。
+- **`if (ready == 0)` 出现两次**（`ib_plugin.c:1726-1727`）：第一次 WARN+报错，
+  第二次是不可达的历史遗留——现行语义是 NCCL 拿到非 NULL comm 后才准调 isend，
+  ready==0 属内部错误。
+- **`pHandle` 参数**：v11 给 profiler 的 proxy handle，IB 后端透传未用。
+- **`slots[0]` 的 memset 只清一个 elem**：就绪判断只看 `slots[0].idx`，该 slot
+  下次复用时对端会整组重写；清零只为防旧值误判与调试。
