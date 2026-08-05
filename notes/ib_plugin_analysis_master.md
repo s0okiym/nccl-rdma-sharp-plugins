@@ -833,7 +833,7 @@ buffer**。插件从头到尾不理解 tag 的语义，只做相等比较。
 ### 15.2 tag 的含义：发送方 rank
 
 tag 的语义是"**消息的发送者是谁**"，具体值是发送 rank 的 `topParentRank`
-（无 PXN 时即为 communicator 内的 rank 号）：
+（未做 comm split 时即为 communicator 内的 rank 号，见附 J）：
 
 - 发送方给每条消息盖章"我是谁"：`isend(..., resources->tpRank, ...)`
   （NCCL `src/transport/net.cc:1414`）；
@@ -1296,3 +1296,66 @@ vDev 在数据面被展开成成员 dev 的集合（详见前文各节，此处�
 - **channel/多连接多轨**：NCCL 本来就能用多条连接做多轨，vDev 融合是
   "**一条连接内**多轨"，两者可叠加；
 - **SHARP `isSharpDev`**：正交概念，只影响 CollNet 选卡与 maxComms。
+
+## 21. 附 J：top parent rank 概念解析
+
+附 D 中 tag 的取值 `tpRank`/`tpRemoteRank` 来自 `comm->topParentRanks[]`，本附录
+解释这个映射（行号取自 NCCL 源码）。
+
+### 21.1 定义：最顶层祖先 communicator 里的 rank 编号
+
+NCCL 支持 `ncclCommSplit` 从父 comm 分裂出子 comm，子 comm 还可再分裂，形成
+一棵 **communicator 家族树**。`topParentRanks[]` 把"当前 comm 的 rank"翻译为
+"家族树最顶端 comm 的 rank"：
+
+- **默认（未 split）**：恒等映射（`init.cc:545-547`）：
+
+```c
+for (int i = 0; i < comm->nRanks; ++i) comm->topParentRanks[i] = i;
+```
+
+- **split 出子 comm 时**（`bootstrap.cc:949-952`，`bootstrapSplit`，前提是父
+  comm 开了 `shareResources`）：
+
+```c
+/* map local rank to top parent local rank. */
+for (int i = 0; i < nranks; ++i)
+  comm->topParentRanks[i] = parent->topParentRanks[parentRanks[i]];
+```
+
+子 comm 的 rank i → 它在父 comm 中的编号 `parentRanks[i]` → 经父的映射**递归
+上溯**，直到最初的顶层 comm。
+
+### 21.2 为什么需要这个命名空间
+
+split 家族的**资源是共享且挂在顶层**的：`shareResources` 的子 comm 不再自建
+proxy 服务，而是复用顶层 comm 的 proxy、网络连接与共享缓冲池
+（bootstrap.cc 中 shareResources 分支跳过 `ncclProxyInit`）。所有跨 comm 共享
+的数据结构因此需要一个**全家族一致**的 rank 命名空间——否则 comm A 的 rank 5
+与 comm B 的 rank 3 可能是同一物理进程也可能是不同进程，无法作共享池的键。
+顶层 comm 的 rank 空间就是这个全局键。代码体现：
+
+- `proxy.cc:1151`：`tpProxyRank = comm->topParentRanks[proxyRank]`——定位
+  proxy 服务进程；
+- `channel.cc:37`：`sharedRes->peers[channelId] + comm->topParentRanks[r]`——
+  共享 peer 缓冲按 top parent rank 索引；
+- `net.cc:318-319`：建连时 `tpRank`/`tpRemoteRank` 都取 top parent rank——
+  **网络连接建立在 top-parent 命名空间里**，多个子 comm 可复用同一条连接，
+  不必各建一套。
+
+### 21.3 与 tag 的关系
+
+附 D 中 tag = 发送方 `tpRank`，即 top parent rank：shared comms 的连接可能
+承载来自不同子 comm 的流，发送方身份必须在全家族一致的命名空间里表达，对端
+才能正确区分。**未做 comm split 时 `topParentRanks[i]=i`，tag 即本 comm 内的
+普通 rank 号**——注意这一等价条件是"无 comm split"而非"无 PXN"（PXN 影响
+proxy/连接归属，不影响该映射）。
+
+### 21.4 配套概念：topLocalRank
+
+平行映射 `topParentLocalRanks[]`：顶层 comm 命名空间下的"节点内 rank"
+（localRank = rank within node）。共享缓冲池中按节点内身份索引处使用，如
+net.cc 的 `localPeers[tpLocalRank]`、`sharedNetBuffersInit(tpLocalRank, ...)`。
+
+一句话：**top parent rank 是 comm split 家族树里的"全局身份证"——资源挂在
+树顶，身份用树顶的编号；不 split 时退化为普通 rank 号**。
