@@ -1188,3 +1188,111 @@ nreqs=1 走的是附 C 的**最短路径**：size 随 imm_data 回传、不追�
 WR、一次 isend 独立成组即时发射。grouped 机制在 1:1 拓扑下只是闲置而非开销
 ——credit 聚合的收益本来就是为了补偿"多流挤一条连接"的场景；一卡一连接时
 本来就不需要它。
+
+## 20. 附 I：物理 dev 与 vDev 的关系及设计意图
+
+这套机制横跨两个仓库：**融合策略在 NCCL 核心（拓扑构建期），融合执行与资源
+管理在插件**（NCCL 侧行号取自 `src/graph/topo.cc`）。
+
+### 20.1 两个结构体的本质分工
+
+**物理 dev（`ncclIbDev`，上限 32）= 资源实体**。一个 ibv 端口一项，持有一切
+真实的 verbs 资源：ibv_context、共享 PD（`pdRefs` 引用计数）、MR 缓存、缓存的
+portAttr、AR 标志、provider 能力（mlx5/data-direct）、per-dev 错误统计、异步
+事件线程。
+
+**vDev（`ncclIbMergedDev`，上限 256）= 纯账本**（`p2p_plugin.h:56`）：
+
+```c
+ncclNetVDeviceProps_t vProps;   // 成员物理 dev 下标列表（≤4）
+int speed;                      // 成员带宽之和
+char devName[...];              // "mlx5_0+mlx5_1" 拼接名
+```
+
+vDev **不持有任何 verbs 资源**——没有 context、QP、CQ。它只是"NCCL 视角下的
+一张逻辑网卡"。
+
+### 20.2 生命周期：谁创建、谁使用
+
+```
+插件 init（nccl_p2p_ib_init）
+  每发现一个物理端口 → 自动建一个单成员 vDev（p2p_plugin.c:668-673）
+  → 初始时 vDev 与物理 dev 1:1 对应
+        │
+NCCL 拓扑构建（ncclTopoProcessNet）
+  devices() 拿到的是 vDev 数；getProperties(vDev) 返回聚合视图 + vProps
+  若插件提供 makeVDevice（v9+ API）→ ncclTopoMakeVNics：
+    a) NCCL_NET_FORCE_MERGE 显式分组（用户指定哪些卡融合）
+    b) ncclTopoAutoMerge 自动聚类：
+       算任意两张物理 NIC 的拓扑路径距离，
+       贪心地把距离 ≤ mergeLevel 的卡聚成一组（≤maxDevsPerNic=4），
+       逐组调插件 makeVDevice(vProps) → 插件校验后追加新 vDev
+        │
+NCCL 图搜索：把 vDev 当作一张网卡（带宽=聚合值）选路
+        │
+listen/connect/accept 收到的是 vDev 下标
+  → 插件展开 vProps.devs[]，在每个成员物理 dev 上建资源
+```
+
+**NCCL 从头到尾只用 vDev 下标**；物理 dev 下标只在插件内部出现。老 API
+（v8 及以前，无 makeVDevice）时 NCCL 退化为直接使用物理设备
+（topo.cc:1710 `usePhysicalDevices`）。
+
+### 20.3 NCCL 侧的融合策略
+
+- **自动融合**（`ncclTopoAutoMerge`，topo.cc:1378）：计算物理 NIC 两两的拓扑
+  路径距离（PATH_LOC/PORT/PIX/PXB/PHB/SYS…），贪心聚类——`距离 ≤ mergeLevel`
+  且（`NCCL_NET_MERGE_POLICY=RAIL` 时）`railId` 相同的卡进一组，每组 ≤4；
+- **默认 mergeLevel = PATH_PORT**（topo.cc:1744）：只有"同一张物理卡的多个
+  端口/VF"才会被自动融合——它们天然共享同一 PCIe 入口，最保守、无跨域公平性
+  问题。`NCCL_NET_MERGE_LEVEL=PIX/PXB/PHB/…` 放宽到同 PCIe switch/同 host 桥；
+  **`=LOC` 完全关闭融合**；
+- **显式融合**：`NCCL_NET_FORCE_MERGE="mlx5_0,mlx5_1;mlx5_2,mlx5_3"`（分号分
+  组、逗号分成员）；
+- **失败回退**：成员标记为未放置、距离设为 PATH_DIS，重新搜索。
+
+插件侧 `ncclIbMakeVDeviceInternal`（`p2p_plugin.c:469`）只做校验与记账：
+`NCCL_IB_MERGE_NICS` 开关、≤4、**链路类型必须同构**（IB 不能与 RoCE 融）、算
+聚合带宽与拼接名。策略一概不管——**策略需要全局拓扑视野，只有 NCCL 核心有；
+插件只有 verbs 层的可行性判断**。这正是 makeVDevice 设计成回调的原因。
+
+### 20.4 连接与数据路径上的展开
+
+vDev 在数据面被展开成成员 dev 的集合（详见前文各节，此处归拢）：
+
+- **MR**：同一 buffer 在每个成员 dev 的共享 PD 上各注册一次，
+  `mhandle = mrs[4]` 数组（§6）；
+- **QP**：按成员轮转创建，`qp->devIndex` 记录归属（§5.3）；
+- **credit**：`rkeys[4]` 携带该 buffer 在每个成员 dev 上的 rkey，发送端按
+  `qp->remDevIdx` 选用（§7）；
+- **条带**：128B 对齐 chunk 按 QP 轮转 → 物理上按成员 dev 分流（§7.4）；
+- **flush**：每个成员 dev 一个自环 QP（§7.6）；
+- **完成模型**：`events[4]` 按成员 dev 计数，test 按 per-dev CQ 轮询（§7.5）。
+
+**双端融合度可以不同**：connect/accept 先交换 vProps，
+`nqps = max(双端ndevs) × NCCL_IB_QPS_PER_CONNECTION`、`nDataQps = max(...)`
+——一端 2 卡融合、另一端单卡也能建链，QP 数取大者保证条带对称（§5.3）。
+
+### 20.5 设计意图总结
+
+1. **多轨聚合带宽**：一 GPU 多 NIC（或单卡多口）时，融合后**一条连接**即可
+   条带化打满全部成员卡；聚合带宽写进拓扑，NCCL 图搜索按真实总带宽选路；
+2. **关注点分离**：物理 dev 管 per-HCA 资源与能力，vDev 只是组合视图；NCCL
+   拓扑只跟 vDev 打交道，数据路径只在物理 dev 上跑。插件内部的并发/缓存/
+   统计粒度仍是物理卡；
+3. **保留单一排序点**：一条连接 = 一个 credit FIFO + 一组 QP 的逻辑流。若用
+   多条独立连接做多轨，需处理跨连接的重排与完成同步；融合把复杂性留在插件
+   内部，对 NCCL 呈现为一张普通网卡；
+4. **策略与机制分离**：融合策略（拓扑距离、rail、用户 env）在 NCCL，可行性
+   校验与记账在插件——所以它是 v9+ 新增的回调，而非插件自发行为；
+5. **保守默认**：默认只融合同一 PCI 设备的端口/VF（PATH_PORT），跨 PCIe 域
+   必须用户显式放宽——跨域融合会把不同 NUMA/PCIe 树下的卡绑成一个流，可能
+   引入不公平竞争。
+
+### 20.6 与相似概念的区分
+
+- **VF/多口 PCI 合并**（`NCCL_IB_MERGE_VFS`，pciPath 抹位）：只是让 NCCL 拓扑
+  "认出这是同一张卡"，不产生新 vDev；
+- **channel/多连接多轨**：NCCL 本来就能用多条连接做多轨，vDev 融合是
+  "**一条连接内**多轨"，两者可叠加；
+- **SHARP `isSharpDev`**：正交概念，只影响 CollNet 选卡与 maxComms。
