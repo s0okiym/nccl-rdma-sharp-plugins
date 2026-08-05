@@ -1122,3 +1122,69 @@ NCCL 自带的 `printProxyOp`（proxy.cc:266）即按此模型打印：
 用户 API（coll / p2p group）→ 每 channel/对端一个 proxy op → 同 opCount 合并
 为一个 args（多 subs）→ proxy 按 recvComm 把 subs 聚成 ≤8 的组 → 插件
 grouped irecv 一次 post 一组 → 一个 request 完成整组。
+
+## 19. 附 H：为什么 8 GPU : 8 NIC 机器上 nreqs / nsubs 几乎恒为 1
+
+现象：在 8 张 GPU 对应 8 张 RDMA 网卡（1:1 rail-optimized）的机器上，插件
+isend/irecv 中的 `nreqs` 与 NCCL proxy args 的 `nsubs` 绝大部分时候都是 1。
+这是符合预期的，两个观测互为因果。
+
+### 19.1 为什么 nreqs 几乎总是 1
+
+`nreqs > 1` 的前提是一次 grouped irecv 聚进 ≥2 个 sub，而聚组的前提是**多条流
+共享同一条 recvComm**（`recvProxyProgress` 按 recvComm 聚类，见附 E/G）。共享
+的发生条件（NCCL net.cc）：
+
+```c
+// shared comms 的键：netComms[netDev][tpRemoteRank].recvComm[channelId]
+if (resources->maxRecvs > 1 && ncclParamNetSharedComms()) { ... 复用连接 ... }
+```
+
+即"同一 proxy 进程内，多条流的 (netDev, 对端 rank, channelId) 完全相同"。
+8 GPU : 8 NIC 的 1:1 拓扑下每个 rank 独占一张网卡：
+
+- 不同对端 → `tpRemoteRank` 不同 → 不同共享条目；
+- 不同 channel → `channelId` 不同 → 不同条目；
+- 不同本地 rank → `netDev` 不同（各用各的 NIC）→ 不同条目。
+
+每条流都有独立连接，聚组时每组只有 1 个 sub，故 **nreqs 恒为 1**。共享真正
+生效的场景：PXN（多 GPU 流量经同一 rank 的网卡/proxy 转发）、GPU 数多于网卡
+数（如 8 GPU 对 2 NIC）、同一 (channel, peer) 建多条连接（connIndex>0）。
+
+### 19.2 为什么 nsubs 几乎总是 1
+
+`nsubs > 1` 需要 `ProxyAppend` 把多个 op 合并进一个 args，合并条件：
+
+```c
+if (shared && args->opCount == op->opCount) { 追加为 sub }
+```
+
+而连接的 `shared` 标志（net.cc 的 sendSetup/recvSetup）：
+
+```c
+shared = (graph || connIndex == 0) ? 0 : (NCCL_NET_SHARED_BUFFERS ?: 1);
+```
+
+- **集合通信（ring/tree）graph 非空 → shared 恒 0** → 每个 op 独占一个 args →
+  **nsubs 恒 1**。以 all_reduce/all_gather 等集合通信为主（如 nccl-tests 的
+  对应 perf 程序）时，这就是全部解释；
+- 只有 **p2p 批量**（`ncclGroup` 内多个 send/recv，如 alltoall）且 connIndex>0
+  的连接才 shared，同 opCount 的流才合并出多 sub。
+
+### 19.3 什么时候会看到 >1
+
+跑 **alltoall 类 p2p 负载**（nccl-tests 的 `alltoall_perf` 即 ncclGroup 批量
+send/recv）并满足共享条件——如开启 PXN、网卡数少于 GPU 数——即可看到
+nsubs>1 的 args 与插件侧 nreqs>1 的 grouped irecv。验证方法：
+
+```sh
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=PROXY,NET ./build/alltoall_perf -b 1M -e 128M ...
+# PROXY 日志 printProxyOp 一个方括号内出现多段 "peer状态/channel" 即多 sub
+```
+
+### 19.4 没有性能损失
+
+nreqs=1 走的是附 C 的**最短路径**：size 随 imm_data 回传、不追加 sizesFifo
+WR、一次 isend 独立成组即时发射。grouped 机制在 1:1 拓扑下只是闲置而非开销
+——credit 聚合的收益本来就是为了补偿"多流挤一条连接"的场景；一卡一连接时
+本来就不需要它。
